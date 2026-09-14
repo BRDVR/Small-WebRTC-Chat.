@@ -114,9 +114,26 @@
   </div>
 
   <script type="module">
-    import { joinRoom, selfId } from "https://cdn.jsdelivr.net/npm/@trystero-p2p/torrent/+esm";
+    import { joinRoom, selfId, getRelaySockets } from "https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt/+esm";
 
-    const APP = { appId: "brdvr-small-webrtc-chat" };
+    const APP = {
+      appId: "brdvr-small-webrtc-chat",
+      handshakeTimeoutMs: 30000,
+      relayConfig: {
+        urls: [
+          "wss://broker.emqx.io:8084/mqtt",
+          "wss://test.mosquitto.org:8081/mqtt",
+          "wss://broker.hivemq.com:8884/mqtt"
+        ],
+        redundancy: 3
+      },
+      rtcConfig: {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun.cloudflare.com:3478" }
+        ]
+      }
+    };
     const $ = (id) => document.getElementById(id);
 
     if (location.protocol === "file:") {
@@ -285,7 +302,13 @@
       if (asHost) addLine(myName + " is the host", true);
 
       try {
-        room = joinRoom(APP, "room-" + code);
+        room = joinRoom(APP, "room-" + code, {
+          onJoinError: (info) => {
+            const why = (info && (info.error || info.reason || info.message)) || "peer handshake failed";
+            addLine("Join error: " + String(why), true);
+            statusEl.textContent = "Handshake failed. Both tabs must stay open on the https page.";
+          }
+        });
       } catch (err) {
         setReady(false, "Could not start room");
         addLine("Could not start room.", true);
@@ -297,7 +320,13 @@
 
       room.onPeerJoin = (peerId) => {
         packet({ type: "hello", name: myName }, peerId);
-        if (isHost) announceHost(peerId);
+        if (isHost) {
+          announceHost(peerId);
+        } else {
+          packet({ type: "hello", name: myName }, peerId);
+          setReady(true, "Connected to a peer. Waiting for host name…");
+        }
+        statusEl.textContent = "Peers: " + Object.keys(room.getPeers()).length;
       };
 
       room.onPeerLeave = (peerId) => {
@@ -314,15 +343,27 @@
       packet({ type: "hello", name: myName });
       if (isHost) {
         announceHost();
-        setReady(true, "Connected");
-      } else {
-        window.setTimeout(() => {
-          if (!ready) {
-            setReady(false, "No host found. Check the code and that the host tab is still open.");
-            addLine("No host found yet. Keep this tab open, or ask the host to create the room again.", true);
-          }
-        }, 12000);
+        setReady(true, "Waiting for people to join…");
       }
+
+      let checks = 0;
+      const timer = window.setInterval(() => {
+        checks += 1;
+        const peers = room && room.getPeers ? Object.keys(room.getPeers()) : [];
+        const sockets = getRelaySockets ? Object.values(getRelaySockets()) : [];
+        const liveRelays = sockets.filter((s) => s && s.readyState === 1).length;
+        if (peers.length) {
+          statusEl.textContent = "Peers: " + peers.length + " · relays: " + liveRelays;
+        } else {
+          statusEl.textContent = "Looking for peers… relays connected: " + liveRelays;
+        }
+        if (!isHost && !ready && checks >= 20) {
+          window.clearInterval(timer);
+          addLine("The joiner never saw the host. Same room code, both on the GitHub https page, both tabs left open.", true);
+          addLine("If relays connected is 0, the public MQTT brokers are blocked on this network.", true);
+        }
+        if (ready && peers.length) window.clearInterval(timer);
+      }, 1500);
     }
 
     function sendChat() {
