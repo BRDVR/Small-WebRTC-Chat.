@@ -4,7 +4,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Simple Chat</title>
-  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -65,6 +64,12 @@
     .sys { color: #555; }
     .hidden { display: none; }
     .err { color: #a00; margin-top: 8px; }
+    .warn {
+      border: 1px solid #111;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #fff;
+    }
   </style>
 </head>
 <body>
@@ -73,6 +78,9 @@
       <span>Simple Chat</span>
       <span class="role" id="role"></span>
     </h1>
+    <div id="fileWarn" class="warn hidden">
+      This page was opened as a local file. Use the GitHub Pages https link instead.
+    </div>
 
     <div id="setup">
       <label for="name">Your name</label>
@@ -84,7 +92,7 @@
 
       <label for="code">Or join with a room code</label>
       <div class="row">
-        <input id="code" type="text" placeholder="paste room code" autocomplete="off">
+        <input id="code" type="text" placeholder="paste room code" autocomplete="off" maxlength="12">
         <button id="join">Join</button>
       </div>
       <div class="err" id="setupErr"></div>
@@ -95,17 +103,25 @@
         <div>Room code: <span id="roomCode"></span> <button id="copy">Copy</button></div>
         <div>Host: <span id="hostName">—</span></div>
         <div>People: <span id="people">—</span></div>
+        <div id="status">Connecting…</div>
       </div>
       <div id="log"></div>
       <div class="row">
-        <input id="msg" type="text" placeholder="Type a message" maxlength="500">
-        <button id="send">Send</button>
+        <input id="msg" type="text" placeholder="Type a message" maxlength="500" disabled>
+        <button id="send" disabled>Send</button>
       </div>
     </div>
   </div>
 
-  <script>
+  <script type="module">
+    import { joinRoom, selfId } from "https://esm.run/trystero";
+
+    const APP = { appId: "brdvr-small-webrtc-chat" };
     const $ = (id) => document.getElementById(id);
+
+    if (location.protocol === "file:") {
+      $("fileWarn").classList.remove("hidden");
+    }
 
     const setupEl = $("setup");
     const roomEl = $("room");
@@ -118,43 +134,30 @@
     const roomCodeEl = $("roomCode");
     const hostNameEl = $("hostName");
     const peopleEl = $("people");
+    const statusEl = $("status");
 
-    let peer = null;
+    let room = null;
+    let sendPacket = null;
     let isHost = false;
     let myName = "";
     let hostName = "";
-    let hostConn = null;
-    const clients = new Map(); // peerId -> { conn, name }
-
-    const peerOptions = {
-      debug: 0,
-      config: {
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun.cloudflare.com:3478" }
-        ]
-      }
-    };
+    let hostId = "";
+    let ready = false;
+    const names = new Map();
 
     function cleanName(raw) {
       return String(raw || "").replace(/\s+/g, " ").trim().slice(0, 32);
     }
 
-    function peopleList() {
-      const names = [];
-      if (isHost) names.push(myName + " (host)");
-      else if (hostName) names.push(hostName + " (host)");
-      if (isHost) {
-        for (const c of clients.values()) {
-          if (c.name) names.push(c.name);
-        }
-      }
-      return names.length ? names.join(", ") : "—";
+    function makeCode() {
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      let out = "";
+      for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+      return out;
     }
 
-    function renderPeople() {
-      peopleEl.textContent = peopleList();
-      hostNameEl.textContent = isHost ? myName : (hostName || "—");
+    function normCode(raw) {
+      return String(raw || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12);
     }
 
     function addLine(text, sys) {
@@ -165,181 +168,171 @@
       logEl.scrollTop = logEl.scrollHeight;
     }
 
-    function showRoom() {
+    function peopleText() {
+      const list = [];
+      const hostLabel = (isHost ? myName : hostName) || "Host";
+      list.push(hostLabel + " (host)");
+      const seen = new Set([hostLabel]);
+      if (!isHost && myName && myName !== hostLabel) {
+        list.push(myName);
+        seen.add(myName);
+      }
+      for (const n of names.values()) {
+        if (n && !seen.has(n)) {
+          list.push(n);
+          seen.add(n);
+        }
+      }
+      return list.join(", ");
+    }
+
+    function renderMeta() {
+      hostNameEl.textContent = (isHost ? myName : hostName) || "—";
+      peopleEl.textContent = peopleText();
+    }
+
+    function setReady(ok, text) {
+      ready = ok;
+      statusEl.textContent = text;
+      msgEl.disabled = !ok;
+      $("send").disabled = !ok;
+    }
+
+    function showRoom(code) {
       setupEl.classList.add("hidden");
       roomEl.classList.remove("hidden");
       roleEl.textContent = isHost ? "HOST" : "";
-      renderPeople();
-      msgEl.focus();
+      roomCodeEl.textContent = code;
+      renderMeta();
     }
 
     function fail(msg) {
       setupErr.textContent = msg;
+      $("create").disabled = false;
+      $("join").disabled = false;
     }
 
-    function broadcast(payload, exceptId) {
-      const data = JSON.stringify(payload);
-      for (const [id, client] of clients) {
-        if (id === exceptId) continue;
-        if (client.conn && client.conn.open) {
-          try { client.conn.send(data); } catch (e) {}
+    function packet(obj) {
+      if (sendPacket) sendPacket(obj);
+    }
+
+    function announceHost(target) {
+      const payload = {
+        type: "host",
+        hostName: myName,
+        hostId: selfId,
+        people: peopleText()
+      };
+      if (target) sendPacket(payload, target);
+      else packet(payload);
+    }
+
+    function onPacket(data, peerId) {
+      if (!data || typeof data !== "object") return;
+
+      if (data.type === "hello") {
+        const n = cleanName(data.name) || "Guest";
+        names.set(peerId, n);
+        if (isHost) {
+          addLine(n + " joined", true);
+          announceHost();
+          packet({ type: "sys", text: n + " joined" });
         }
-      }
-    }
-
-    function sendTo(conn, payload) {
-      if (!conn || !conn.open) return;
-      try { conn.send(JSON.stringify(payload)); } catch (e) {}
-    }
-
-    function handleIncoming(payload, fromId) {
-      if (!payload || typeof payload !== "object") return;
-
-      if (payload.type === "hello") {
-        const n = cleanName(payload.name) || "Guest";
-        const client = clients.get(fromId);
-        if (client) client.name = n;
-        sendTo(clients.get(fromId)?.conn, {
-          type: "welcome",
-          hostName: myName,
-          people: [myName + " (host)"].concat(
-            [...clients.values()].filter((c) => c.name).map((c) => c.name)
-          )
-        });
-        addLine(n + " joined", true);
-        broadcast({ type: "sys", text: n + " joined" }, fromId);
-        broadcast({
-          type: "host",
-          hostName: myName,
-          people: [myName + " (host)"].concat(
-            [...clients.values()].filter((c) => c.name).map((c) => c.name)
-          )
-        });
-        renderPeople();
+        renderMeta();
         return;
       }
 
-      if (payload.type === "chat") {
-        const n = cleanName(payload.name) || "Guest";
-        const text = String(payload.text || "").slice(0, 500);
+      if (data.type === "host") {
+        hostName = cleanName(data.hostName) || hostName;
+        hostId = data.hostId || hostId;
+        if (!isHost) {
+          setReady(true, "Connected");
+          roleEl.textContent = "";
+          if (hostName && !logEl.dataset.hostTold) {
+            addLine(hostName + " is the host", true);
+            logEl.dataset.hostTold = "1";
+          }
+        }
+        renderMeta();
+        return;
+      }
+
+      if (data.type === "sys") {
+        addLine(String(data.text || ""), true);
+        return;
+      }
+
+      if (data.type === "chat") {
+        const n = cleanName(data.name) || "Guest";
+        const text = String(data.text || "").slice(0, 500);
         if (!text) return;
+        if (n === myName && peerId !== selfId) return;
         addLine(n + ": " + text, false);
-        broadcast({ type: "chat", name: n, text }, fromId);
-        return;
       }
     }
 
-    function attachHostConnection(conn) {
-      clients.set(conn.peer, { conn, name: "" });
-      conn.on("data", (raw) => {
-        let payload = raw;
-        if (typeof raw === "string") {
-          try { payload = JSON.parse(raw); } catch (e) { return; }
-        }
-        handleIncoming(payload, conn.peer);
-      });
-      conn.on("close", () => {
-        const left = clients.get(conn.peer);
-        clients.delete(conn.peer);
-        if (left && left.name) {
-          addLine(left.name + " left", true);
-          broadcast({ type: "sys", text: left.name + " left" });
-          broadcast({
-            type: "host",
-            hostName: myName,
-            people: [myName + " (host)"].concat(
-              [...clients.values()].filter((c) => c.name).map((c) => c.name)
-            )
-          });
-        }
-        renderPeople();
-      });
-      conn.on("error", () => {});
-    }
+    async function enterRoom(code, asHost) {
+      isHost = asHost;
+      hostName = asHost ? myName : "";
+      hostId = asHost ? selfId : "";
+      names.clear();
+      names.set(selfId, myName);
 
-    function startHost() {
-      isHost = true;
-      hostName = myName;
-      peer = new Peer(peerOptions);
-      peer.on("open", (id) => {
-        roomCodeEl.textContent = id;
-        showRoom();
-        addLine("Room created. Share the room code.", true);
-        addLine(myName + " is the host", true);
-        renderPeople();
-      });
-      peer.on("connection", (conn) => {
-        conn.on("open", () => attachHostConnection(conn));
-      });
-      peer.on("error", (err) => {
-        fail("Could not create room: " + (err.type || err.message || "error"));
-      });
-      peer.on("disconnected", () => {
-        addLine("Host connection dropped.", true);
-      });
-    }
+      showRoom(code);
+      setReady(false, "Connecting…");
+      addLine(asHost ? "Room created. Share the room code." : "Looking for the host…", true);
+      if (asHost) addLine(myName + " is the host", true);
 
-    function startGuest(roomId) {
-      isHost = false;
-      peer = new Peer(peerOptions);
-      peer.on("open", () => {
-        hostConn = peer.connect(roomId, { reliable: true });
-        hostConn.on("open", () => {
-          roomCodeEl.textContent = roomId;
-          showRoom();
-          sendTo(hostConn, { type: "hello", name: myName });
-        });
-        hostConn.on("data", (raw) => {
-          let payload = raw;
-          if (typeof raw === "string") {
-            try { payload = JSON.parse(raw); } catch (e) { return; }
-          }
-          if (!payload || typeof payload !== "object") return;
-          if (payload.type === "welcome" || payload.type === "host") {
-            hostName = cleanName(payload.hostName) || hostName;
-            if (Array.isArray(payload.people) && payload.people.length) {
-              peopleEl.textContent = payload.people.join(", ");
-            }
-            hostNameEl.textContent = hostName || "—";
-            if (payload.type === "welcome") {
-              addLine(hostName + " is the host", true);
-            }
-            return;
-          }
-          if (payload.type === "sys") {
-            addLine(String(payload.text || ""), true);
-            return;
-          }
-          if (payload.type === "chat") {
-            const n = cleanName(payload.name) || "Guest";
-            const text = String(payload.text || "").slice(0, 500);
-            if (text) addLine(n + ": " + text, false);
-          }
-        });
-        hostConn.on("close", () => {
+      try {
+        room = joinRoom(APP, "room-" + code);
+      } catch (err) {
+        setReady(false, "Could not start room");
+        addLine("Could not start room.", true);
+        return;
+      }
+
+      const actions = room.makeAction("pkt");
+      sendPacket = actions[0];
+      const getPacket = actions[1];
+      getPacket(onPacket);
+
+      room.onPeerJoin((peerId) => {
+        packet({ type: "hello", name: myName }, peerId);
+        if (isHost) announceHost(peerId);
+      });
+
+      room.onPeerLeave((peerId) => {
+        const n = names.get(peerId);
+        names.delete(peerId);
+        if (n) addLine(n + " left", true);
+        if (!isHost && peerId === hostId) {
+          setReady(false, "Host closed the room");
           addLine("Host closed the room.", true);
-          msgEl.disabled = true;
-          $("send").disabled = true;
-        });
-        hostConn.on("error", () => {
-          fail("Could not join that room. Check the code and that the host page is still open.");
-        });
+        }
+        renderMeta();
       });
-      peer.on("error", (err) => {
-        fail("Could not join: " + (err.type || err.message || "error"));
-      });
+
+      packet({ type: "hello", name: myName });
+      if (isHost) {
+        announceHost();
+        setReady(true, "Connected");
+      } else {
+        window.setTimeout(() => {
+          if (!ready) {
+            setReady(false, "No host found. Check the code and that the host tab is still open.");
+            addLine("No host found yet. Keep this tab open, or ask the host to create the room again.", true);
+          }
+        }, 12000);
+      }
     }
 
     function sendChat() {
+      if (!ready) return;
       const text = msgEl.value.replace(/^\s+|\s+$/g, "");
       if (!text) return;
       msgEl.value = "";
       addLine(myName + ": " + text, false);
-      if (isHost) {
-        broadcast({ type: "chat", name: myName, text });
-      } else if (hostConn) {
-        sendTo(hostConn, { type: "chat", name: myName, text });
-      }
+      packet({ type: "chat", name: myName, text });
     }
 
     $("create").onclick = () => {
@@ -348,18 +341,18 @@
       if (!myName) return fail("Enter a name first.");
       $("create").disabled = true;
       $("join").disabled = true;
-      startHost();
+      enterRoom(makeCode(), true);
     };
 
     $("join").onclick = () => {
       setupErr.textContent = "";
       myName = cleanName(nameEl.value);
-      const roomId = codeEl.value.replace(/\s+/g, "").trim();
+      const code = normCode(codeEl.value);
       if (!myName) return fail("Enter a name first.");
-      if (!roomId) return fail("Paste a room code.");
+      if (code.length < 4) return fail("Paste the full room code.");
       $("create").disabled = true;
       $("join").disabled = true;
-      startGuest(roomId);
+      enterRoom(code, false);
     };
 
     $("send").onclick = sendChat;
