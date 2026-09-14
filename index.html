@@ -114,7 +114,7 @@
   </div>
 
   <script type="module">
-    import { joinRoom, selfId } from "https://esm.run/trystero";
+    import { joinRoom, selfId } from "https://cdn.jsdelivr.net/npm/@trystero-p2p/torrent/+esm";
 
     const APP = { appId: "brdvr-small-webrtc-chat" };
     const $ = (id) => document.getElementById(id);
@@ -137,7 +137,7 @@
     const statusEl = $("status");
 
     let room = null;
-    let sendPacket = null;
+    let action = null;
     let isHost = false;
     let myName = "";
     let hostName = "";
@@ -212,22 +212,23 @@
       $("join").disabled = false;
     }
 
-    function packet(obj) {
-      if (sendPacket) sendPacket(obj);
+    function packet(obj, target) {
+      if (!action) return;
+      if (target) action.send(obj, { target });
+      else action.send(obj);
     }
 
     function announceHost(target) {
-      const payload = {
+      packet({
         type: "host",
         hostName: myName,
         hostId: selfId,
         people: peopleText()
-      };
-      if (target) sendPacket(payload, target);
-      else packet(payload);
+      }, target);
     }
 
-    function onPacket(data, peerId) {
+    function onPacket(data, info) {
+      const peerId = info && info.peerId;
       if (!data || typeof data !== "object") return;
 
       if (data.type === "hello") {
@@ -291,17 +292,15 @@
         return;
       }
 
-      const actions = room.makeAction("pkt");
-      sendPacket = actions[0];
-      const getPacket = actions[1];
-      getPacket(onPacket);
+      action = room.makeAction("pkt");
+      action.onMessage = onPacket;
 
-      room.onPeerJoin((peerId) => {
+      room.onPeerJoin = (peerId) => {
         packet({ type: "hello", name: myName }, peerId);
         if (isHost) announceHost(peerId);
-      });
+      };
 
-      room.onPeerLeave((peerId) => {
+      room.onPeerLeave = (peerId) => {
         const n = names.get(peerId);
         names.delete(peerId);
         if (n) addLine(n + " left", true);
@@ -310,7 +309,7 @@
           addLine("Host closed the room.", true);
         }
         renderMeta();
-      });
+      };
 
       packet({ type: "hello", name: myName });
       if (isHost) {
