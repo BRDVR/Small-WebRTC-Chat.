@@ -1,2 +1,257 @@
 <!DOCTYPE html>
-<!-- see artifacts; pushing via read -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simple Chat</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 16px/1.4 system-ui, sans-serif; color: #111; background: #fff; }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 16px; }
+    h1 { margin: 0 0 12px; font-size: 18px; font-weight: 700; display: flex; justify-content: space-between; gap: 12px; }
+    .role { font-weight: 700; }
+    label { display: block; margin: 10px 0 4px; }
+    input[type="text"] { width: 100%; padding: 8px; border: 1px solid #111; font: inherit; background: #fff; }
+    button { padding: 8px 12px; border: 1px solid #111; background: #fff; font: inherit; cursor: pointer; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+    .row input[type="text"] { flex: 1; min-width: 140px; }
+    .meta, .box { border: 1px solid #111; padding: 8px 10px; margin: 12px 0; }
+    .meta div { margin: 2px 0; }
+    #log { border: 1px solid #111; min-height: 200px; max-height: 36vh; overflow: auto; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+    .sys { color: #555; }
+    .hidden { display: none; }
+    .err { color: #a00; margin-top: 8px; }
+    .warn { border: 1px solid #111; padding: 10px; margin-bottom: 12px; }
+    .avatar { width: 40px; height: 40px; object-fit: cover; border: 1px solid #111; background: #eee; flex: none; }
+    .avatar.lg { width: 64px; height: 64px; }
+    .person { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+    .tiles { display: flex; flex-wrap: wrap; gap: 8px; }
+    .tile { border: 1px solid #111; width: 220px; padding: 6px; }
+    .tile video { width: 100%; height: 140px; background: #000; object-fit: cover; display: block; }
+    .tile .who { margin-top: 6px; display: flex; align-items: center; gap: 6px; }
+    .chatline { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0; }
+    .chatline img { width: 28px; height: 28px; object-fit: cover; border: 1px solid #111; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1><span>Simple Chat</span><span class="role" id="role"></span></h1>
+    <div id="fileWarn" class="warn hidden">Open the GitHub Pages https link, not a local file.</div>
+    <div id="setup">
+      <label>Your avatar</label>
+      <div class="row">
+        <img id="myAvatar" class="avatar lg" alt="">
+        <input id="avatarFile" type="file" accept="image/*">
+      </div>
+      <label for="name">Your name</label>
+      <input id="name" type="text" maxlength="32" autocomplete="nickname">
+      <div class="row"><button id="create">Create room</button></div>
+      <label for="code">Or join with a room code</label>
+      <div class="row">
+        <input id="code" type="text" placeholder="paste room code" maxlength="12" autocomplete="off">
+        <button id="join">Join</button>
+      </div>
+      <div class="err" id="setupErr"></div>
+    </div>
+    <div id="room" class="hidden">
+      <div class="meta">
+        <div>Room code: <span id="roomCode"></span> <button id="copy">Copy</button></div>
+        <div>Host: <span id="hostName">—</span></div>
+        <div id="status">Connecting…</div>
+      </div>
+      <div class="box"><div><b>People</b></div><div id="peopleList"></div></div>
+      <div class="box">
+        <div><b>Call channel</b> — text stays open even if you leave the call</div>
+        <div class="row">
+          <button id="joinCall">Join call</button>
+          <button id="leaveCall" disabled>Leave call</button>
+          <label><input id="wantCam" type="checkbox"> Camera</label>
+          <label><input id="wantMic" type="checkbox" checked> Mic</label>
+        </div>
+        <div id="callStatus">Not in the call.</div>
+        <div id="tiles" class="tiles"></div>
+      </div>
+      <div id="log"></div>
+      <div class="row">
+        <input id="msg" type="text" placeholder="Type a message" maxlength="500" disabled>
+        <button id="send" disabled>Send</button>
+      </div>
+    </div>
+  </div>
+  <script type="module">
+    import { joinRoom, selfId, getRelaySockets } from "https://cdn.jsdelivr.net/npm/@trystero-p2p/mqtt/+esm";
+    const STORE_NAME = "swc-name";
+    const STORE_AVATAR = "swc-avatar";
+    const ICE = [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun.cloudflare.com:3478" },
+      { urls: "stun:stun.relay.metered.ca:80" },
+      { urls: ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443", "turn:openrelay.metered.ca:443?transport=tcp"], username: "openrelayproject", credential: "openrelayproject" }
+    ];
+    const APP = {
+      appId: "brdvr-small-webrtc-chat",
+      handshakeTimeoutMs: 30000,
+      relayConfig: { urls: ["wss://broker.emqx.io:8084/mqtt", "wss://test.mosquitto.org:8081/mqtt", "wss://broker.hivemq.com:8884/mqtt"], redundancy: 3 },
+      turnConfig: ICE.filter((s) => String(s.urls).includes("turn")),
+      rtcConfig: { iceServers: ICE }
+    };
+    const $ = (id) => document.getElementById(id);
+    if (location.protocol === "file:") $("fileWarn").classList.remove("hidden");
+    let room = null, action = null, isHost = false, myName = "", myAvatar = "", hostName = "", hostId = "", ready = false, inCall = false, localStream = null;
+    const people = new Map();
+    try { myName = localStorage.getItem(STORE_NAME) || ""; myAvatar = localStorage.getItem(STORE_AVATAR) || ""; } catch (e) {}
+    $("name").value = myName; $("myAvatar").src = myAvatar || "";
+    function cleanName(raw) { return String(raw || "").replace(/\s+/g, " ").trim().slice(0, 32); }
+    function makeCode() { const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let out = ""; for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)]; return out; }
+    function normCode(raw) { return String(raw || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 12); }
+    function saveMe() { try { localStorage.setItem(STORE_NAME, myName); if (myAvatar) localStorage.setItem(STORE_AVATAR, myAvatar); } catch (e) {} }
+    function shrinkImage(file) {
+      return new Promise((resolve, reject) => {
+        const img = new Image(); const url = URL.createObjectURL(file);
+        img.onload = () => {
+          const canvas = document.createElement("canvas"); canvas.width = 96; canvas.height = 96;
+          const ctx = canvas.getContext("2d"); const side = Math.min(img.width, img.height);
+          ctx.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, 96, 96);
+          URL.revokeObjectURL(url); resolve(canvas.toDataURL("image/jpeg", 0.7));
+        };
+        img.onerror = reject; img.src = url;
+      });
+    }
+    function upsertPerson(id, patch) { const cur = people.get(id) || { name: "Guest", avatar: "", inCall: false }; people.set(id, Object.assign(cur, patch)); renderPeople(); }
+    function addLine(name, avatar, text, sys) {
+      const row = document.createElement("div"); row.className = sys ? "sys" : "chatline";
+      if (!sys && avatar) { const img = document.createElement("img"); img.src = avatar; img.alt = ""; row.appendChild(img); }
+      const span = document.createElement("div"); span.textContent = sys ? text : (name + ": " + text); if (sys) span.className = "sys"; row.appendChild(span);
+      $("log").appendChild(row); $("log").scrollTop = $("log").scrollHeight;
+    }
+    function renderPeople() {
+      $("hostName").textContent = (isHost ? myName : hostName) || "—";
+      const box = $("peopleList"); box.innerHTML = "";
+      const entries = [[selfId, { name: myName + (isHost ? " (host, you)" : " (you)"), avatar: myAvatar, inCall }]];
+      for (const [id, p] of people) {
+        if (id === selfId) continue;
+        const label = p.name + (id === hostId || (!isHost && p.name === hostName) ? " (host)" : "") + (p.inCall ? " · in call" : "");
+        entries.push([id, { name: label, avatar: p.avatar, inCall: p.inCall }]);
+      }
+      for (const [, p] of entries) {
+        const row = document.createElement("div"); row.className = "person";
+        const img = document.createElement("img"); img.className = "avatar"; img.alt = ""; if (p.avatar) img.src = p.avatar;
+        const n = document.createElement("div"); n.textContent = p.name; row.appendChild(img); row.appendChild(n); box.appendChild(row);
+      }
+    }
+    function setReady(ok, text) { ready = ok; $("status").textContent = text; $("msg").disabled = !ok; $("send").disabled = !ok; }
+    function showRoom(code) { $("setup").classList.add("hidden"); $("room").classList.remove("hidden"); $("role").textContent = isHost ? "HOST" : ""; $("roomCode").textContent = code; renderPeople(); }
+    function fail(msg) { $("setupErr").textContent = msg; $("create").disabled = false; $("join").disabled = false; }
+    function packet(obj, target) { if (!action) return; if (target) action.send(obj, { target }); else action.send(obj); }
+    function helloPayload() { return { type: "hello", name: myName, avatar: myAvatar, inCall }; }
+    function announceHost(target) { packet({ type: "host", hostName: myName, hostId: selfId, avatar: myAvatar }, target); }
+    function tileId(peerId) { return "tile-" + String(peerId).replace(/[^a-zA-Z0-9_-]/g, ""); }
+    function ensureTile(peerId, name, avatar) {
+      let tile = document.getElementById(tileId(peerId));
+      if (!tile) { tile = document.createElement("div"); tile.className = "tile"; tile.id = tileId(peerId); tile.innerHTML = '<video playsinline autoplay></video><div class="who"><img class="avatar" alt=""><span></span></div>'; $("tiles").appendChild(tile); }
+      tile.querySelector("span").textContent = name || "Guest"; if (avatar) tile.querySelector("img").src = avatar; return tile;
+    }
+    function removeTile(peerId) { const tile = document.getElementById(tileId(peerId)); if (tile) tile.remove(); }
+    async function startCall() {
+      if (inCall) return;
+      const wantCam = $("wantCam").checked, wantMic = $("wantMic").checked;
+      if (!wantCam && !wantMic) { $("callStatus").textContent = "Turn on mic or camera first."; return; }
+      try { localStream = await navigator.mediaDevices.getUserMedia({ audio: wantMic, video: wantCam ? { width: 320, height: 240 } : false }); }
+      catch (err) { $("callStatus").textContent = "Could not use mic/camera. Check the browser permission."; return; }
+      inCall = true; $("joinCall").disabled = true; $("leaveCall").disabled = false; $("callStatus").textContent = "You are in the call.";
+      const mine = ensureTile(selfId, myName + " (you)", myAvatar); mine.querySelector("video").srcObject = localStream; mine.querySelector("video").muted = true;
+      if (room && room.addStream) room.addStream(localStream);
+      packet({ type: "call", on: true, name: myName }); renderPeople();
+    }
+    function stopCall() {
+      if (localStream) { if (room && room.removeStream) { try { room.removeStream(localStream); } catch (e) {} } localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+      inCall = false; $("joinCall").disabled = false; $("leaveCall").disabled = true; $("callStatus").textContent = "Not in the call."; removeTile(selfId);
+      packet({ type: "call", on: false, name: myName }); renderPeople();
+    }
+    function onPacket(data, info) {
+      const peerId = info && info.peerId; if (!data || typeof data !== "object") return;
+      if (data.type === "hello") {
+        const n = cleanName(data.name) || "Guest"; upsertPerson(peerId, { name: n, avatar: data.avatar || "", inCall: !!data.inCall });
+        if (isHost) { addLine("", "", n + " joined", true); announceHost(); packet({ type: "sys", text: n + " joined" }); }
+        return;
+      }
+      if (data.type === "host") {
+        hostName = cleanName(data.hostName) || hostName; hostId = data.hostId || hostId;
+        if (data.avatar) upsertPerson(peerId, { name: hostName, avatar: data.avatar });
+        if (!isHost) { setReady(true, "Connected"); if (!$("log").dataset.hostTold) { addLine("", "", hostName + " is the host", true); $("log").dataset.hostTold = "1"; } }
+        renderPeople(); return;
+      }
+      if (data.type === "sys") { addLine("", "", String(data.text || ""), true); return; }
+      if (data.type === "chat") {
+        const n = cleanName(data.name) || "Guest"; const text = String(data.text || "").slice(0, 500); if (!text) return;
+        if (n === myName && peerId !== selfId) return;
+        const av = (people.get(peerId) && people.get(peerId).avatar) || ""; addLine(n, av, text, false); return;
+      }
+      if (data.type === "call") {
+        const n = cleanName(data.name) || (people.get(peerId) && people.get(peerId).name) || "Guest";
+        upsertPerson(peerId, { name: n, inCall: !!data.on });
+        addLine("", "", n + (data.on ? " joined the call" : " left the call"), true);
+        if (!data.on) removeTile(peerId);
+      }
+    }
+    async function enterRoom(code, asHost) {
+      isHost = asHost; hostName = asHost ? myName : ""; hostId = asHost ? selfId : ""; people.clear();
+      showRoom(code); setReady(false, "Connecting…");
+      addLine("", "", asHost ? "Room created. Share the room code." : "Looking for the host…", true);
+      if (asHost) addLine("", "", myName + " is the host", true);
+      try {
+        room = joinRoom(APP, "room-" + code, { onJoinError: (info) => { addLine("", "", "Join error: " + String((info && (info.error || info.reason || info.message)) || "peer handshake failed"), true); } });
+      } catch (err) { setReady(false, "Could not start room"); return; }
+      action = room.makeAction("pkt"); action.onMessage = onPacket;
+      room.onPeerJoin = (peerId) => {
+        packet(helloPayload(), peerId); if (isHost) announceHost(peerId); else setReady(true, "Connected to a peer.");
+        if (inCall && localStream && room.addStream) room.addStream(localStream, { target: peerId });
+      };
+      room.onPeerLeave = (peerId) => {
+        const p = people.get(peerId); if (p) addLine("", "", p.name + " left", true);
+        people.delete(peerId); removeTile(peerId);
+        if (!isHost && peerId === hostId) { setReady(false, "Host closed the room"); addLine("", "", "Host closed the room.", true); stopCall(); }
+        renderPeople();
+      };
+      room.onPeerStream = (stream, peerId) => {
+        const p = people.get(peerId) || { name: "Guest", avatar: "" };
+        ensureTile(peerId, p.name, p.avatar).querySelector("video").srcObject = stream;
+        upsertPerson(peerId, { inCall: true });
+      };
+      packet(helloPayload());
+      if (isHost) { announceHost(); setReady(true, "Waiting for people to join…"); }
+      let checks = 0;
+      const timer = window.setInterval(() => {
+        checks += 1;
+        const peers = room && room.getPeers ? Object.keys(room.getPeers()) : [];
+        const sockets = getRelaySockets ? Object.values(getRelaySockets()) : [];
+        const liveRelays = sockets.filter((s) => s && s.readyState === 1).length;
+        $("status").textContent = peers.length ? ("Peers: " + peers.length + " · relays: " + liveRelays) : ("Looking for peers… relays connected: " + liveRelays);
+        if (ready && peers.length) window.clearInterval(timer);
+        if (!isHost && !ready && checks >= 20) window.clearInterval(timer);
+      }, 1500);
+    }
+    function sendChat() {
+      if (!ready) return; const text = $("msg").value.replace(/^\s+|\s+$/g, ""); if (!text) return;
+      $("msg").value = ""; addLine(myName, myAvatar, text, false); packet({ type: "chat", name: myName, text });
+    }
+    $("avatarFile").onchange = async (e) => {
+      const file = e.target.files && e.target.files[0]; if (!file) return;
+      try { myAvatar = await shrinkImage(file); $("myAvatar").src = myAvatar; saveMe(); } catch (err) { fail("Could not read that image."); }
+    };
+    $("create").onclick = () => { $("setupErr").textContent = ""; myName = cleanName($("name").value); if (!myName) return fail("Enter a name first."); saveMe(); $("create").disabled = true; $("join").disabled = true; enterRoom(makeCode(), true); };
+    $("join").onclick = () => { $("setupErr").textContent = ""; myName = cleanName($("name").value); const code = normCode($("code").value); if (!myName) return fail("Enter a name first."); if (code.length < 4) return fail("Paste the full room code."); saveMe(); $("create").disabled = true; $("join").disabled = true; enterRoom(code, false); };
+    $("send").onclick = sendChat;
+    $("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
+    $("joinCall").onclick = startCall;
+    $("leaveCall").onclick = stopCall;
+    $("copy").onclick = async () => {
+      const id = $("roomCode").textContent; if (!id) return;
+      try { await navigator.clipboard.writeText(id); $("copy").textContent = "Copied"; setTimeout(() => { $("copy").textContent = "Copy"; }, 1000); }
+      catch (e) { prompt("Copy this room code:", id); }
+    };
+    window.addEventListener("beforeunload", () => { if (inCall) stopCall(); });
+  </script>
+</body>
+</html>
